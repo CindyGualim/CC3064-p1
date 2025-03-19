@@ -1,24 +1,21 @@
 /********************************************************
  * server.c
  *
- * Extensión del servidor con varias acciones del protocolo:
- *  - REGISTRO (ya teníamos)
- *  - EXIT
- *  - BROADCAST
- *  - DM
- *  - LISTA
- *  - MOSTRAR
- *  - ESTADO
+ * Servidor multihilo para chat, con las acciones del protocolo:
+ * - REGISTRO
+ * - EXIT
+ * - BROADCAST
+ * - DM
+ * - LISTA
+ * - MOSTRAR
+ * - ESTADO
  *
- * REFERENCIAS PDFs:
- *  - "Definición de proyecto Chat 2025, v1.pdf":
- *    -> Broadcasting, mensajes directos, listado de usuarios,
- *       salida controlada (EXIT), manejo de status, etc.
- *  - "Organización general.pdf":
- *    -> cJSON y campos del protocolo ("accion":"BROADCAST", etc.).
+ * Referencias:
+ *  - Definición de proyecto Chat 2025, v1.pdf
+ *  - Organización general.pdf
  *
- * COMPILAR:
- *   gcc client.c -o client -lcjson
+ * Para compilar:
+ *   gcc server.c -o server -lpthread -lcjson
  ********************************************************/
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,18 +26,31 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <cjson/cJSON.h>
+#include <ctype.h> // Para toupper
 
 #define PORT 50213
 #define BACKLOG 10
 #define BUFSIZE 1024
 #define MAX_CLIENTS 10
 
+void strToUpper(char *dest, const char *src) {
+    while (*src) {
+        *dest = toupper((unsigned char)*src);
+        dest++;
+        src++;
+    }
+    *dest = '\0';
+}
+
+/********************************************************
+ * Estructura para cada cliente en la lista global.
+ ********************************************************/
 typedef struct {
     int socketFD;
     char nombre[50];
     char ip[50];
-    char status[10];  // "ACTIVO", "OCUPADO", "INACTIVO" etc.
-    int activo;       // 1 si está conectado
+    char status[10]; // "ACTIVO", "OCUPADO", "INACTIVO"
+    int activo;      // 1 si está conectado, 0 si no
 } Cliente;
 
 static Cliente clientesConectados[MAX_CLIENTS];
@@ -74,7 +84,55 @@ void enviarJSON(int socketFD, cJSON *obj) {
 }
 
 /********************************************************
- * Función auxiliar: buscar índice del cliente por FD
+ * registrarUsuario()
+ *  - Recibe: nombre, ip y socketFD
+ *  - Verifica si nombre e ip ya están en uso
+ *  - Si no, lo inserta en la lista
+ *  - Retorna 0 si éxito, -1 si duplicado / sin espacio
+ ********************************************************/
+int registrarUsuario(const char *nombre, const char *ip, int socketFD) {
+    pthread_mutex_lock(&clientesMutex);
+
+    // Revisar si ya existe usuario o IP en uso
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clientesConectados[i].activo == 1) {
+            // Si el nombre existe
+            if (strcmp(clientesConectados[i].nombre, nombre) == 0) {
+                pthread_mutex_unlock(&clientesMutex);
+                return -1; // nombre duplicado
+            }
+            /* 
+            if (strcmp(clientesConectados[i].ip, ip) == 0) {
+                pthread_mutex_unlock(&clientesMutex);
+                return -1; // ip duplicada
+            }
+            */ //comentado para probar con ips repetidas
+        }
+    }
+
+    // Buscar espacio libre
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clientesConectados[i].activo == 0) {
+            clientesConectados[i].socketFD = socketFD;
+            strcpy(clientesConectados[i].nombre, nombre);
+            strcpy(clientesConectados[i].ip, ip);
+            strcpy(clientesConectados[i].status, "ACTIVO");
+            clientesConectados[i].activo = 1;
+
+            // Mensaje en el servidor cuando un usario se registra
+            printf("[SERVIDOR] Usuario registrado: %s | IP: %s | FD: %d\n",
+                clientesConectados[i].nombre, clientesConectados[i].ip, socketFD);
+            pthread_mutex_unlock(&clientesMutex);
+            return 0; // éxito
+        }
+    }
+
+    pthread_mutex_unlock(&clientesMutex);
+    return -1; // sin espacio
+}
+
+/********************************************************
+ * Funciones auxiliares
  ********************************************************/
 int buscarClientePorFD(int fd) {
     pthread_mutex_lock(&clientesMutex);
@@ -89,17 +147,13 @@ int buscarClientePorFD(int fd) {
     return -1;
 }
 
-/********************************************************
- * Función auxiliar: liberarCliente (para "EXIT")
- ********************************************************/
 void liberarCliente(int fd) {
     pthread_mutex_lock(&clientesMutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clientesConectados[i].activo == 1 &&
             clientesConectados[i].socketFD == fd) {
-            // Marcarlo como inactivo
             clientesConectados[i].activo = 0;
-            printf("[Servidor] Liberado cliente '%s' (FD=%d)\n",
+            printf("[Servidor] Liberado cliente '%s' (FD:%d)\n",
                    clientesConectados[i].nombre, fd);
             break;
         }
@@ -108,13 +162,7 @@ void liberarCliente(int fd) {
 }
 
 /********************************************************
- * BROADCAST: Enviar a todos el mensaje
- * Se espera un JSON del cliente:
- * {
- *   "accion": "BROADCAST",
- *   "nombre_emisor": "nombre_emisor",
- *   "mensaje": "texto del mensaje"
- * }
+ * BROADCAST: "accion":"BROADCAST"
  ********************************************************/
 void manejarBroadcast(int emisorFD, cJSON *root) {
     cJSON *nom = cJSON_GetObjectItem(root, "nombre_emisor");
@@ -123,13 +171,13 @@ void manejarBroadcast(int emisorFD, cJSON *root) {
         responderError(emisorFD, "FORMATO_BROADCAST_INVALIDO");
         return;
     }
-    // Creamos el JSON que enviaremos a todos
+
+    // JSON para enviar a todos
     cJSON *bcast = cJSON_CreateObject();
     cJSON_AddStringToObject(bcast, "accion", "BROADCAST");
     cJSON_AddStringToObject(bcast, "nombre_emisor", nom->valuestring);
     cJSON_AddStringToObject(bcast, "mensaje", msg->valuestring);
 
-    // Recorremos lista de clientes y enviamos
     pthread_mutex_lock(&clientesMutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clientesConectados[i].activo == 1) {
@@ -142,8 +190,7 @@ void manejarBroadcast(int emisorFD, cJSON *root) {
 }
 
 /********************************************************
- * DM: Mensaje directo a un usuario
- * El PDF: "accion":"DM", "nombre_emisor":"...", "nombre_destinatario":"...", "mensaje":"..."
+ * DM: "accion":"DM"
  ********************************************************/
 void manejarDM(int emisorFD, cJSON *root) {
     cJSON *nomEmisor = cJSON_GetObjectItem(root, "nombre_emisor");
@@ -155,20 +202,17 @@ void manejarDM(int emisorFD, cJSON *root) {
         return;
     }
 
-    // Construimos el JSON a enviar al destinatario
     cJSON *dm = cJSON_CreateObject();
     cJSON_AddStringToObject(dm, "accion", "DM");
     cJSON_AddStringToObject(dm, "nombre_emisor", nomEmisor->valuestring);
     cJSON_AddStringToObject(dm, "nombre_destinatario", nomDest->valuestring);
     cJSON_AddStringToObject(dm, "mensaje", msg->valuestring);
 
-    // Buscar al destinatario en la lista (por nombre)
     pthread_mutex_lock(&clientesMutex);
     int encontrado = 0;
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clientesConectados[i].activo == 1 &&
             strcmp(clientesConectados[i].nombre, nomDest->valuestring) == 0) {
-            // Enviarle el DM
             enviarJSON(clientesConectados[i].socketFD, dm);
             encontrado = 1;
             break;
@@ -179,16 +223,13 @@ void manejarDM(int emisorFD, cJSON *root) {
     if (!encontrado) {
         responderError(emisorFD, "DESTINATARIO_NO_ENCONTRADO");
     } else {
-        // Podemos responder OK al emisor
         responderOK(emisorFD);
     }
     cJSON_Delete(dm);
 }
 
 /********************************************************
- * LISTA: Servidor responde con usuarios conectados
- * "accion":"LISTA"
- * Respuesta: {"accion":"LISTA","usuarios":["user1","user2",...]}
+ * LISTA: "accion":"LISTA"
  ********************************************************/
 void manejarLista(int emisorFD) {
     cJSON *resp = cJSON_CreateObject();
@@ -197,8 +238,11 @@ void manejarLista(int emisorFD) {
     cJSON *arrUsuarios = cJSON_CreateArray();
 
     pthread_mutex_lock(&clientesMutex);
+    printf("[SERVIDOR] Generando lista de usuarios conectados...\n");
+
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clientesConectados[i].activo == 1) {
+            printf("[SERVIDOR] Usuario activo: %s\n", clientesConectados[i].nombre);
             cJSON_AddItemToArray(arrUsuarios, cJSON_CreateString(clientesConectados[i].nombre));
         }
     }
@@ -206,14 +250,16 @@ void manejarLista(int emisorFD) {
 
     cJSON_AddItemToObject(resp, "usuarios", arrUsuarios);
 
-    enviarJSON(emisorFD, resp);
+    char *strJson = cJSON_Print(resp);
+    printf("[SERVIDOR] Enviando lista: %s\n", strJson); // Imprime en el servidor lo que se enviará
+    send(emisorFD, strJson, strlen(strJson), 0);
+
+    free(strJson);
     cJSON_Delete(resp);
 }
 
 /********************************************************
- * MOSTRAR: info de un usuario (pdf sugiere IP o estado)
- * "tipo":"MOSTRAR","usuario":"..."  // en PDF
- * Respuesta: {"tipo":"MOSTRAR","usuario":"X","estado":"..." } etc.
+ * MOSTRAR: "tipo":"MOSTRAR"
  ********************************************************/
 void manejarMostrar(int emisorFD, cJSON *root) {
     cJSON *usuario = cJSON_GetObjectItem(root, "usuario");
@@ -230,11 +276,9 @@ void manejarMostrar(int emisorFD, cJSON *root) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clientesConectados[i].activo == 1 &&
             strcmp(clientesConectados[i].nombre, usuario->valuestring) == 0) {
-            // Agregar info
             cJSON_AddStringToObject(resp, "usuario", clientesConectados[i].nombre);
             cJSON_AddStringToObject(resp, "estado", clientesConectados[i].status);
-            // Si quieres también la IP:
-            // cJSON_AddStringToObject(resp, "ip", clientesConectados[i].ip);
+            // cJSON_AddStringToObject(resp, "ip", clientesConectados[i].ip); // opcional
             encontrado = 1;
             break;
         }
@@ -250,41 +294,58 @@ void manejarMostrar(int emisorFD, cJSON *root) {
 }
 
 /********************************************************
- * ESTADO: "tipo":"ESTADO","usuario":"X","estado":"ACTIVO"
- * Cambiar en la lista
+ * ESTADO: "tipo":"ESTADO"
  ********************************************************/
 void manejarEstado(int emisorFD, cJSON *root) {
     cJSON *usuario = cJSON_GetObjectItem(root, "usuario");
-    cJSON *estado = cJSON_GetObjectItem(root, "estado");
+    cJSON *estado  = cJSON_GetObjectItem(root, "estado");
+
     if (!cJSON_IsString(usuario) || !cJSON_IsString(estado)) {
         responderError(emisorFD, "FORMATO_ESTADO_INVALIDO");
         return;
     }
 
-    // Buscar en lista y modificar
+    // 1) Convertir el nuevo estado a mayúsculas
+    char nuevoEstado[20];
+    strToUpper(nuevoEstado, estado->valuestring);
+
     pthread_mutex_lock(&clientesMutex);
-    int actualizado = 0;
+
+    int encontrado = 0;
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clientesConectados[i].activo == 1 &&
             strcmp(clientesConectados[i].nombre, usuario->valuestring) == 0) {
-            strcpy(clientesConectados[i].status, estado->valuestring);
-            actualizado = 1;
+
+            // 2) Convertir el estado actual a mayúsculas antes de comparar
+            char estadoActual[20];
+            strToUpper(estadoActual, clientesConectados[i].status);
+
+            // 3) Comparar ignoring-case (ya que ambos están en mayúsculas)
+            if (strcmp(estadoActual, nuevoEstado) == 0) {
+                pthread_mutex_unlock(&clientesMutex);
+                responderError(emisorFD, "ESTADO_YA_SELECCIONADO");
+                return;
+            }
+
+            // 4) Diferentes: Actualizamos y respondemos OK
+            strcpy(clientesConectados[i].status, nuevoEstado); 
+            encontrado = 1;
             break;
         }
     }
+
     pthread_mutex_unlock(&clientesMutex);
 
-    if (!actualizado) {
+    if (!encontrado) {
         responderError(emisorFD, "USUARIO_NO_ENCONTRADO");
     } else {
         responderOK(emisorFD);
     }
 }
 
+
 /********************************************************
- * Manejo del hilo para cada cliente (similar a antes),
- * pero ahora manejamos las acciones extras:
- *   BROADCAST, DM, LISTA, EXIT, MOSTRAR, ESTADO
+ * Manejo del hilo para cada cliente
  ********************************************************/
 void* manejarCliente(void *arg) {
     int clientFD = *(int*)arg;
@@ -295,9 +356,8 @@ void* manejarCliente(void *arg) {
         memset(buffer, 0, BUFSIZE);
         int bytes = recv(clientFD, buffer, BUFSIZE - 1, 0);
         if (bytes <= 0) {
-            printf("[Hilo] Cliente FD=%d desconectado.\n", clientFD);
+            printf("[Hilo] Cliente FD: %d desconectado.\n", clientFD);
             close(clientFD);
-            // Liberar de la lista
             liberarCliente(clientFD);
             pthread_exit(NULL);
         }
@@ -310,10 +370,9 @@ void* manejarCliente(void *arg) {
 
         // Revisar "accion" o "tipo"
         cJSON *accion = cJSON_GetObjectItem(root, "accion");
-        cJSON *tipo = cJSON_GetObjectItem(root, "tipo");
-        
-        // Recordatorio: "REGISTRO" y "EXIT" estaban en "tipo",
-        // mientras BROADCAST, DM, LISTA están en "accion"
+        cJSON *tipo   = cJSON_GetObjectItem(root, "tipo");
+
+        // "accion": BROADCAST, DM, LISTA
         if (accion && cJSON_IsString(accion)) {
             if (strcmp(accion->valuestring, "BROADCAST") == 0) {
                 manejarBroadcast(clientFD, root);
@@ -325,19 +384,38 @@ void* manejarCliente(void *arg) {
                 responderError(clientFD, "ACCION_NO_IMPLEMENTADA");
             }
         }
+        // "tipo": REGISTRO, EXIT, MOSTRAR, ESTADO
         else if (tipo && cJSON_IsString(tipo)) {
-            if (strcmp(tipo->valuestring, "EXIT") == 0) {
-                // Liberar y cerrar
+
+            if (strcmp(tipo->valuestring, "REGISTRO") == 0) {
+                // Extraer datos
+                cJSON *usuario = cJSON_GetObjectItem(root, "usuario");
+                cJSON *direccionIP = cJSON_GetObjectItem(root, "direccionIP");
+                if (!cJSON_IsString(usuario) || !cJSON_IsString(direccionIP)) {
+                    responderError(clientFD, "CAMPOS_REGISTRO_INVALIDOS");
+                } else {
+                    if (registrarUsuario(usuario->valuestring, direccionIP->valuestring, clientFD) == 0) {
+                        responderOK(clientFD);
+
+                    } else {
+                        responderError(clientFD, "USUARIO_O_IP_DUPLICADO");
+                    }
+                }
+            }
+            else if (strcmp(tipo->valuestring, "EXIT") == 0) {
                 responderOK(clientFD);
                 close(clientFD);
                 liberarCliente(clientFD);
                 cJSON_Delete(root);
                 pthread_exit(NULL);
-            } else if (strcmp(tipo->valuestring, "MOSTRAR") == 0) {
+            }
+            else if (strcmp(tipo->valuestring, "MOSTRAR") == 0) {
                 manejarMostrar(clientFD, root);
-            } else if (strcmp(tipo->valuestring, "ESTADO") == 0) {
+            }
+            else if (strcmp(tipo->valuestring, "ESTADO") == 0) {
                 manejarEstado(clientFD, root);
-            } else {
+            }
+            else {
                 responderError(clientFD, "TIPO_NO_IMPLEMENTADO");
             }
         }
@@ -352,10 +430,10 @@ void* manejarCliente(void *arg) {
 }
 
 /********************************************************
- * main() - Igual que antes, con lazos de accept + pthread
+ * main()
  ********************************************************/
 int main() {
-    // Inicializar la lista
+    // Inicializar array
     for (int i = 0; i < MAX_CLIENTS; i++) {
         clientesConectados[i].activo = 0;
         strcpy(clientesConectados[i].status, "ACTIVO");
@@ -387,7 +465,7 @@ int main() {
         exit(1);
     }
 
-    printf("[Servidor] Escuchando en puerto %d...\n", PORT);
+    printf("[SERVIDOR] Escuchando en puerto %d...\n", PORT);
 
     while (1) {
         int *nuevoFD = malloc(sizeof(int));
@@ -397,9 +475,7 @@ int main() {
             free(nuevoFD);
             continue;
         }
-        // Podrías aquí llamar a tu rutina de REGISTRO si no lo haces en el hilo.
-        // Pero lo normal es que sea el hilo quien lo maneje.
-
+        // Lanza hilo para manejar al cliente
         pthread_t tid;
         if (pthread_create(&tid, NULL, manejarCliente, nuevoFD) != 0) {
             perror("pthread_create");
