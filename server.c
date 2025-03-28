@@ -16,7 +16,8 @@
  *
  * Para compilar:
  *   gcc server.c -o server -lpthread -lcjson
- ********************************************************/
+ ********************************************************/ 
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,8 +54,8 @@ typedef struct {
     int activo;      // 1 si está conectado, 0 si no
 } Cliente;
 
-static Cliente clientesConectados[MAX_CLIENTS];
-static pthread_mutex_t clientesMutex = PTHREAD_MUTEX_INITIALIZER;
+static Cliente clientesConectados[MAX_CLIENTS]; //gurdar información de clientes conectados
+static pthread_mutex_t clientesMutex = PTHREAD_MUTEX_INITIALIZER; //mutex evita errores de concurrencia como sobreescribir datos.
 
 /*******************************************************
  * Funciones de respuesta en JSON (OK / ERROR / Mensaje)
@@ -278,7 +279,6 @@ void manejarMostrar(int emisorFD, cJSON *root) {
             strcmp(clientesConectados[i].nombre, usuario->valuestring) == 0) {
             cJSON_AddStringToObject(resp, "usuario", clientesConectados[i].nombre);
             cJSON_AddStringToObject(resp, "estado", clientesConectados[i].status);
-            // cJSON_AddStringToObject(resp, "ip", clientesConectados[i].ip); // opcional
             encontrado = 1;
             break;
         }

@@ -6,10 +6,6 @@
  *  - Registrar usuario con JSON "tipo":"REGISTRO"
  *  - Menú para BROADCAST, DM, LISTA, MOSTRAR, ESTADO, EXIT
  *
- * REFERENCIAS:
- *  - Definición de proyecto Chat 2025, v1.pdf
- *  - Organización general.pdf
- *
  * COMPILAR:
  *   gcc client.c -o client -lcjson -lpthread
  ********************************************************/
@@ -159,7 +155,7 @@ int main(int argc, char *argv[]) {
         cJSON *regJson = cJSON_CreateObject();
         cJSON_AddStringToObject(regJson, "tipo", "REGISTRO");
         cJSON_AddStringToObject(regJson, "usuario", nombreUsuario);
-        cJSON_AddStringToObject(regJson, "direccionIP", ipServidor);
+       // cJSON_AddStringToObject(regJson, "direccionIP", ipServidor);
 
         char *strReg = cJSON_Print(regJson);
         send(client_fd, strReg, strlen(strReg), 0);
@@ -167,7 +163,7 @@ int main(int argc, char *argv[]) {
         cJSON_Delete(regJson);
 
         char buffer[BUFSIZE];
-        int bytes = recv(client_fd, buffer, BUFSIZE - 1, MSG_DONTWAIT);  // 👈 No bloquea
+        int bytes = recv(client_fd, buffer, BUFSIZE - 1, MSG_DONTWAIT);  //  No bloquea
         if (bytes > 0) {
             buffer[bytes] = '\0';
             printf("[Servidor]: %s\n", buffer); 
