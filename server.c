@@ -1,23 +1,7 @@
 /********************************************************
  * server.c
- *
- * Servidor multihilo para chat, con las acciones del protocolo:
- * - REGISTRO
- * - EXIT
- * - BROADCAST
- * - DM
- * - LISTA
- * - MOSTRAR
- * - ESTADO
- *
- * Referencias:
- *  - Definición de proyecto Chat 2025, v1.pdf
- *  - Organización general.pdf
- *
- * Para compilar:
- *   gcc server.c -o server -lpthread -lcjson
- ********************************************************/ 
-
+ * Servidor multihilo con desconexión por inactividad
+ ********************************************************/
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,12 +11,15 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <cjson/cJSON.h>
-#include <ctype.h> // Para toupper
+#include <ctype.h>
+#include <time.h>
 
 #define PORT 50213
 #define BACKLOG 10
 #define BUFSIZE 1024
 #define MAX_CLIENTS 10
+#define TIEMPO_INACTIVIDAD 60    // 60 segundos de inactividad
+#define INTERVALO_VERIFICACION 10 // Verificar cada 10 segundos
 
 void strToUpper(char *dest, const char *src) {
     while (*src) {
@@ -43,23 +30,18 @@ void strToUpper(char *dest, const char *src) {
     *dest = '\0';
 }
 
-/********************************************************
- * Estructura para cada cliente en la lista global.
- ********************************************************/
 typedef struct {
     int socketFD;
     char nombre[50];
     char ip[50];
-    char status[10]; // "ACTIVO", "OCUPADO", "INACTIVO"
-    int activo;      // 1 si está conectado, 0 si no
+    char status[10];
+    time_t ultimaActividad;
+    int activo;
 } Cliente;
 
-static Cliente clientesConectados[MAX_CLIENTS]; //gurdar información de clientes conectados
-static pthread_mutex_t clientesMutex = PTHREAD_MUTEX_INITIALIZER; //mutex evita errores de concurrencia como sobreescribir datos.
+static Cliente clientesConectados[MAX_CLIENTS];
+static pthread_mutex_t clientesMutex = PTHREAD_MUTEX_INITIALIZER;
 
-/*******************************************************
- * Funciones de respuesta en JSON (OK / ERROR / Mensaje)
- *******************************************************/
 void responderOK(int socketFD) {
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddStringToObject(resp, "respuesta", "OK");
@@ -68,6 +50,7 @@ void responderOK(int socketFD) {
     free(str);
     cJSON_Delete(resp);
 }
+
 void responderError(int socketFD, const char *razon) {
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddStringToObject(resp, "respuesta", "ERROR");
@@ -77,64 +60,45 @@ void responderError(int socketFD, const char *razon) {
     free(str);
     cJSON_Delete(resp);
 }
-/** Para enviar un JSON cualquiera (útil en BROADCAST, etc.) */
+
 void enviarJSON(int socketFD, cJSON *obj) {
     char *str = cJSON_Print(obj);
     send(socketFD, str, strlen(str), 0);
     free(str);
 }
 
-/********************************************************
- * registrarUsuario()
- *  - Recibe: nombre, ip y socketFD
- *  - Verifica si nombre e ip ya están en uso
- *  - Si no, lo inserta en la lista
- *  - Retorna 0 si éxito, -1 si duplicado / sin espacio
- ********************************************************/
 int registrarUsuario(const char *nombre, const char *ip, int socketFD) {
     pthread_mutex_lock(&clientesMutex);
 
-    // Revisar si ya existe usuario o IP en uso
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clientesConectados[i].activo == 1) {
-            // Si el nombre existe
             if (strcmp(clientesConectados[i].nombre, nombre) == 0) {
                 pthread_mutex_unlock(&clientesMutex);
-                return -1; // nombre duplicado
+                return -1;
             }
-            /* 
-            if (strcmp(clientesConectados[i].ip, ip) == 0) {
-                pthread_mutex_unlock(&clientesMutex);
-                return -1; // ip duplicada
-            }
-            */ //comentado para probar con ips repetidas
         }
     }
 
-    // Buscar espacio libre
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clientesConectados[i].activo == 0) {
             clientesConectados[i].socketFD = socketFD;
             strcpy(clientesConectados[i].nombre, nombre);
             strcpy(clientesConectados[i].ip, ip);
             strcpy(clientesConectados[i].status, "ACTIVO");
+            clientesConectados[i].ultimaActividad = time(NULL);
             clientesConectados[i].activo = 1;
 
-            // Mensaje en el servidor cuando un usario se registra
             printf("[SERVIDOR] Usuario registrado: %s | IP: %s | FD: %d\n",
                 clientesConectados[i].nombre, clientesConectados[i].ip, socketFD);
             pthread_mutex_unlock(&clientesMutex);
-            return 0; // éxito
+            return 0;
         }
     }
 
     pthread_mutex_unlock(&clientesMutex);
-    return -1; // sin espacio
+    return -1;
 }
 
-/********************************************************
- * Funciones auxiliares
- ********************************************************/
 int buscarClientePorFD(int fd) {
     pthread_mutex_lock(&clientesMutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -162,9 +126,6 @@ void liberarCliente(int fd) {
     pthread_mutex_unlock(&clientesMutex);
 }
 
-/********************************************************
- * BROADCAST: "accion":"BROADCAST"
- ********************************************************/
 void manejarBroadcast(int emisorFD, cJSON *root) {
     cJSON *nom = cJSON_GetObjectItem(root, "nombre_emisor");
     cJSON *msg = cJSON_GetObjectItem(root, "mensaje");
@@ -173,7 +134,6 @@ void manejarBroadcast(int emisorFD, cJSON *root) {
         return;
     }
 
-    // JSON para enviar a todos
     cJSON *bcast = cJSON_CreateObject();
     cJSON_AddStringToObject(bcast, "accion", "BROADCAST");
     cJSON_AddStringToObject(bcast, "nombre_emisor", nom->valuestring);
@@ -190,9 +150,6 @@ void manejarBroadcast(int emisorFD, cJSON *root) {
     cJSON_Delete(bcast);
 }
 
-/********************************************************
- * DM: "accion":"DM"
- ********************************************************/
 void manejarDM(int emisorFD, cJSON *root) {
     cJSON *nomEmisor = cJSON_GetObjectItem(root, "nombre_emisor");
     cJSON *nomDest = cJSON_GetObjectItem(root, "nombre_destinatario");
@@ -229,39 +186,26 @@ void manejarDM(int emisorFD, cJSON *root) {
     cJSON_Delete(dm);
 }
 
-/********************************************************
- * LISTA: "accion":"LISTA"
- ********************************************************/
 void manejarLista(int emisorFD) {
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddStringToObject(resp, "accion", "LISTA");
-
     cJSON *arrUsuarios = cJSON_CreateArray();
 
     pthread_mutex_lock(&clientesMutex);
-    printf("[SERVIDOR] Generando lista de usuarios conectados...\n");
-
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clientesConectados[i].activo == 1) {
-            printf("[SERVIDOR] Usuario activo: %s\n", clientesConectados[i].nombre);
             cJSON_AddItemToArray(arrUsuarios, cJSON_CreateString(clientesConectados[i].nombre));
         }
     }
     pthread_mutex_unlock(&clientesMutex);
 
     cJSON_AddItemToObject(resp, "usuarios", arrUsuarios);
-
     char *strJson = cJSON_Print(resp);
-    printf("[SERVIDOR] Enviando lista: %s\n", strJson); // Imprime en el servidor lo que se enviará
     send(emisorFD, strJson, strlen(strJson), 0);
-
     free(strJson);
     cJSON_Delete(resp);
 }
 
-/********************************************************
- * MOSTRAR: "tipo":"MOSTRAR"
- ********************************************************/
 void manejarMostrar(int emisorFD, cJSON *root) {
     cJSON *usuario = cJSON_GetObjectItem(root, "usuario");
     if (!cJSON_IsString(usuario)) {
@@ -277,8 +221,9 @@ void manejarMostrar(int emisorFD, cJSON *root) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clientesConectados[i].activo == 1 &&
             strcmp(clientesConectados[i].nombre, usuario->valuestring) == 0) {
-            cJSON_AddStringToObject(resp, "usuario", clientesConectados[i].nombre);
+            cJSON_AddStringToObject(resp, "User", clientesConectados[i].nombre);
             cJSON_AddStringToObject(resp, "estado", clientesConectados[i].status);
+            cJSON_AddStringToObject(resp, "IP", clientesConectados[i].ip);
             encontrado = 1;
             break;
         }
@@ -293,9 +238,6 @@ void manejarMostrar(int emisorFD, cJSON *root) {
     cJSON_Delete(resp);
 }
 
-/********************************************************
- * ESTADO: "tipo":"ESTADO"
- ********************************************************/
 void manejarEstado(int emisorFD, cJSON *root) {
     cJSON *usuario = cJSON_GetObjectItem(root, "usuario");
     cJSON *estado  = cJSON_GetObjectItem(root, "estado");
@@ -305,35 +247,37 @@ void manejarEstado(int emisorFD, cJSON *root) {
         return;
     }
 
-    // 1) Convertir el nuevo estado a mayúsculas
     char nuevoEstado[20];
     strToUpper(nuevoEstado, estado->valuestring);
 
-    pthread_mutex_lock(&clientesMutex);
+           // Verificar que sea uno de los tres permitidos
+       if (strcmp(nuevoEstado, "ACTIVO") != 0 &&
+       strcmp(nuevoEstado, "OCUPADO") != 0 &&
+       strcmp(nuevoEstado, "INACTIVO") != 0) {
+       responderError(emisorFD, "ESTADO_INVALIDO");
+       return;
+       }
 
+    pthread_mutex_lock(&clientesMutex);
     int encontrado = 0;
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clientesConectados[i].activo == 1 &&
             strcmp(clientesConectados[i].nombre, usuario->valuestring) == 0) {
 
-            // 2) Convertir el estado actual a mayúsculas antes de comparar
             char estadoActual[20];
             strToUpper(estadoActual, clientesConectados[i].status);
 
-            // 3) Comparar ignoring-case (ya que ambos están en mayúsculas)
             if (strcmp(estadoActual, nuevoEstado) == 0) {
                 pthread_mutex_unlock(&clientesMutex);
                 responderError(emisorFD, "ESTADO_YA_SELECCIONADO");
                 return;
             }
 
-            // 4) Diferentes: Actualizamos y respondemos OK
             strcpy(clientesConectados[i].status, nuevoEstado); 
             encontrado = 1;
             break;
         }
     }
-
     pthread_mutex_unlock(&clientesMutex);
 
     if (!encontrado) {
@@ -343,10 +287,30 @@ void manejarEstado(int emisorFD, cJSON *root) {
     }
 }
 
-
 /********************************************************
- * Manejo del hilo para cada cliente
- ********************************************************/
+* Función de verificación de inactividad (modificada)
+********************************************************/
+void* verificarInactividad(void *arg) {
+   while (1) {
+       sleep(INTERVALO_VERIFICACION);
+       time_t ahora = time(NULL);
+
+       pthread_mutex_lock(&clientesMutex);
+       for (int i = 0; i < MAX_CLIENTS; i++) {
+           if (clientesConectados[i].activo == 1) {
+               double segundosInactivo = difftime(ahora, clientesConectados[i].ultimaActividad);
+               if (segundosInactivo >= TIEMPO_INACTIVIDAD) {
+                   printf("[Servidor] Usuario %s marcado como INACTIVO (%.0f segundos)\n",
+                          clientesConectados[i].nombre, segundosInactivo);
+                   strcpy(clientesConectados[i].status, "INACTIVO");  // Solo cambia el estado
+               }
+           }
+       }
+       pthread_mutex_unlock(&clientesMutex);
+   }
+   return NULL;
+}
+
 void* manejarCliente(void *arg) {
     int clientFD = *(int*)arg;
     free(arg);
@@ -356,11 +320,24 @@ void* manejarCliente(void *arg) {
         memset(buffer, 0, BUFSIZE);
         int bytes = recv(clientFD, buffer, BUFSIZE - 1, 0);
         if (bytes <= 0) {
-            printf("[Hilo] Cliente FD: %d desconectado.\n", clientFD);
+            printf("[Hilo] Cliente FD: %d desconectado\n", clientFD);
             close(clientFD);
             liberarCliente(clientFD);
             pthread_exit(NULL);
         }
+
+        // Actualizar actividad y estado
+       pthread_mutex_lock(&clientesMutex);
+       for (int i = 0; i < MAX_CLIENTS; i++) {
+           if (clientesConectados[i].activo == 1 && 
+               clientesConectados[i].socketFD == clientFD) {
+               clientesConectados[i].ultimaActividad = time(NULL);
+               strcpy(clientesConectados[i].status, "ACTIVO");  // Resetear a ACTIVO
+               break;
+           }
+       }
+       pthread_mutex_unlock(&clientesMutex);
+
 
         cJSON *root = cJSON_Parse(buffer);
         if (!root) {
@@ -368,11 +345,9 @@ void* manejarCliente(void *arg) {
             continue;
         }
 
-        // Revisar "accion" o "tipo"
         cJSON *accion = cJSON_GetObjectItem(root, "accion");
         cJSON *tipo   = cJSON_GetObjectItem(root, "tipo");
 
-        // "accion": BROADCAST, DM, LISTA
         if (accion && cJSON_IsString(accion)) {
             if (strcmp(accion->valuestring, "BROADCAST") == 0) {
                 manejarBroadcast(clientFD, root);
@@ -384,11 +359,8 @@ void* manejarCliente(void *arg) {
                 responderError(clientFD, "ACCION_NO_IMPLEMENTADA");
             }
         }
-        // "tipo": REGISTRO, EXIT, MOSTRAR, ESTADO
         else if (tipo && cJSON_IsString(tipo)) {
-
             if (strcmp(tipo->valuestring, "REGISTRO") == 0) {
-                // Extraer datos
                 cJSON *usuario = cJSON_GetObjectItem(root, "usuario");
                 cJSON *direccionIP = cJSON_GetObjectItem(root, "direccionIP");
                 if (!cJSON_IsString(usuario) || !cJSON_IsString(direccionIP)) {
@@ -396,7 +368,6 @@ void* manejarCliente(void *arg) {
                 } else {
                     if (registrarUsuario(usuario->valuestring, direccionIP->valuestring, clientFD) == 0) {
                         responderOK(clientFD);
-
                     } else {
                         responderError(clientFD, "USUARIO_O_IP_DUPLICADO");
                     }
@@ -425,19 +396,22 @@ void* manejarCliente(void *arg) {
 
         cJSON_Delete(root);
     }
-
     return NULL;
 }
 
-/********************************************************
- * main()
- ********************************************************/
 int main() {
-    // Inicializar array
     for (int i = 0; i < MAX_CLIENTS; i++) {
         clientesConectados[i].activo = 0;
         strcpy(clientesConectados[i].status, "ACTIVO");
     }
+
+    // Iniciar hilo de verificación de inactividad
+    pthread_t hilo_verificador;
+    if (pthread_create(&hilo_verificador, NULL, verificarInactividad, NULL) != 0) {
+        perror("Error al crear hilo de verificacion");
+        exit(EXIT_FAILURE);
+    }
+    pthread_detach(hilo_verificador);
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
@@ -447,7 +421,6 @@ int main() {
 
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_len = sizeof(client_addr);
-
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
@@ -467,25 +440,25 @@ int main() {
 
     printf("[SERVIDOR] Escuchando en puerto %d...\n", PORT);
 
-    while (1) {
-        int *nuevoFD = malloc(sizeof(int));
-        *nuevoFD = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
-        if (*nuevoFD < 0) {
-            perror("accept");
-            free(nuevoFD);
-            continue;
-        }
-        // Lanza hilo para manejar al cliente
-        pthread_t tid;
-        if (pthread_create(&tid, NULL, manejarCliente, nuevoFD) != 0) {
-            perror("pthread_create");
-            close(*nuevoFD);
-            free(nuevoFD);
-        } else {
-            pthread_detach(tid);
-        }
-    }
+    while (1) {  // <--- Bucle principal de aceptación
+       int *nuevoFD = malloc(sizeof(int));
+       *nuevoFD = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+       if (*nuevoFD < 0) {
+           perror("accept");
+           free(nuevoFD);
+           continue;
+       }
 
-    close(server_fd);
-    return 0;
-}
+       pthread_t tid;
+       if (pthread_create(&tid, NULL, manejarCliente, nuevoFD) != 0) {
+           perror("pthread_create");
+           close(*nuevoFD);
+           free(nuevoFD);
+       } else {
+           pthread_detach(tid);
+       }
+   }
+
+   close(server_fd);
+   return 0;
+}  // <--- Cierre de la función main()
